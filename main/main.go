@@ -2,14 +2,14 @@ package main
 
 import (
 	geerpc "GeeRPC"
-	"GeeRPC/codec"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 )
 
+// 协程负责监听、处理信息
 func startServer(addr chan string) {
 	l, _ := net.Listen("tcp", ":0")
 	log.Println("start rpc server on", l.Addr())
@@ -18,28 +18,30 @@ func startServer(addr chan string) {
 }
 
 func main() {
+	log.SetFlags(0)
 	addr := make(chan string)
 	go startServer(addr)
 
-	conn, _ := net.Dial("tcp", <-addr)
-	defer func() { conn.Close() }()
+	//主进程负责连接，传递信息
+	client, _ := geerpc.Dial("tcp", <-addr)
+	defer func() { client.Close() }()
 
 	time.Sleep(time.Second)
 
-	//send Options
-	json.NewEncoder(conn).Encode(geerpc.DefaultOption)
-	cc := codec.NewGobCodec(conn)
-
 	//send request & receive response
-	for i := 0; i < 5; i++ {
-		h := &codec.Header{
-			ServiceMethod: "Foo.sum",
-			Seq:           uint64(i),
-		}
-		cc.Write(h, fmt.Sprintf("geerpc req %d", h.Seq))
-		cc.ReadHeader(h)
-		var reply string
-		cc.ReadBody(&reply)
-		log.Println("reply:", reply)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			args := fmt.Sprintf("geerpc req %d", i)
+			var reply string
+			if err := client.Call("Foo.sum", args, &reply); err != nil {
+				log.Fatal("call Foo.sum error:", err)
+			}
+			log.Println("reply:", reply)
+		}(i)
 	}
+	wg.Wait()
+
 }
