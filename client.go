@@ -2,12 +2,14 @@ package geerpc
 
 import (
 	"GeeRPC/codec"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 //net/rpc 可以被远程调用的函数模板：
@@ -215,27 +217,6 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	return opt, nil
 }
 
-// Dial connects to an RPC server at the specified network address
-func Dial(network, address string, opts ...*Option) (client *Client, err error) {
-	opt, err := parseOptions(opts...)
-	if err != nil {
-		return nil, err
-	}
-	//创建到服务器的连接
-	conn, err := net.Dial(network, address)
-	if err != nil {
-		return nil, err
-	}
-
-	defer func() {
-		if client == nil {
-			conn.Close()
-		}
-	}()
-
-	return NewClient(conn, opt)
-}
-
 // 发送请求
 func (client *Client) send(call *Call) {
 	//按序发送，完整发送
@@ -294,10 +275,26 @@ func (client *Client) Go(ServiceMethod string, args, reply interface{}, done cha
 
 // Call invokes the named function, waits for it to complete,
 // and returns its error status.
-func (client *Client) Call(ServiceMethod string, args, reply interface{}) error {
+/*
+用户可以使用 context.WithTimeout 创建具备超时检测能力的 context 对象来控制。
+例如：
+ctx, _ := context.WithTimeout(context.Background(), time.Second)
+var reply int
+err := client.Call(ctx, "Foo.Sum", &Args{1, 2}, &reply)
+...
+*/
+
+func (client *Client) Call(ctx context.Context, ServiceMethod string, args, reply interface{}) error {
 	//创建call,注册call,移除call，等待发送call完成
-	call := <-client.Go(ServiceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+	call := client.Go(ServiceMethod, args, reply, make(chan *Call, 1))
+
+	select {
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	case call := <-call.Done:
+		return call.Error
+	}
 }
 
 /*
@@ -319,3 +316,52 @@ Call 是对 Go 的封装，阻塞 call.Done，等待响应返回，是一个同�
 
 						otherFunc() # 不阻塞，继续执行其他函数。
 */
+
+// 客户端连接超时
+type clientResult struct {
+	client *Client
+	err    error
+}
+
+type newClientFunc func(conn net.Conn, opt *Option) (*Client, error)
+
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
+	opt, err := parseOptions(opts...)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	defer func() {
+		if err != nil {
+			_ = conn.Close()
+		}
+
+	}()
+
+	ch := make(chan clientResult)
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client, err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+
+	select {
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	case result := <-ch:
+		return result.client, result.err
+
+	}
+}
+
+// Dial connects to an RPC server at the specified network address
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
+}
