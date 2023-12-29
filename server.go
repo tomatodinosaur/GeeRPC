@@ -3,11 +3,12 @@ package geerpc
 import (
 	"GeeRPC/codec"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -37,7 +38,9 @@ GeeRPC 客户端固定采用 JSON 编码 Option，
 */
 
 // sever represents an RPC Server
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map //服务池
+}
 
 // NewServer returns a new Server
 func NewSever() *Server {
@@ -130,8 +133,10 @@ func (server *Server) severCodec(cc codec.Codec) {
 
 // request stores all information of a call
 type request struct {
-	h            *codec.Header //header :header of request
+	h            *codec.Header //header :header of request:   <service.Method,seq,Error>
 	argv, replyv reflect.Value //body :argv and replyv of request
+	svc          *service      //服务
+	mtype        *methodType   //方法
 }
 
 func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
@@ -145,18 +150,39 @@ func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	return &h, nil
 }
 
+/*
+通过 newArgv() 和 newReplyv() 两个方法创建出两个入参实例，
+然后通过 cc.ReadBody() 将请求报文反序列化为第一个入参 argv，
+在这里同样需要注意 argv 可能是值类型，也可能是指针类型，
+所以处理方式有点差异。
+*/
+
 func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	h, err := server.readRequestHeader(cc)
 	if err != nil {
 		return nil, err
 	}
 	req := &request{h: h}
-	// TODO: now we don't know the type of request argv
-	// day 1, just suppose it's string
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
-		log.Println("rpc server: read argv err:", err)
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
 	}
+	req.argv = req.mtype.newArgv()
+	req.replyv = req.mtype.newReplyv()
+
+	//make sure that argvi is a pointer,
+	//ReadBody need a pointer as parameter
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+
+	//将请求报文中的Body 反序列化为 argv
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("rpc server: read body err:", err)
+		return req, err
+	}
+
 	return req, nil
 }
 
@@ -170,19 +196,60 @@ func (server *Server) sendResponse(cc codec.Codec, h *codec.Header, body interfa
 }
 
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
-	// TODO, should call registered rpc methods to get the right replyv
-	// day 1, just print argv and send a hello message
 	defer wg.Done()
-	log.Println(req.h, req.argv.Elem())
-	req.replyv = reflect.ValueOf(fmt.Sprintf("geerpc resp %d", req.h.Seq))
+	err := req.svc.call(req.mtype, req.argv, req.replyv)
+	if err != nil {
+		req.h.Error = err.Error()
+		server.sendResponse(cc, req.h, invalidRequest, sending)
+		return
+	}
 	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 
 }
 
+// 在Server端注册服务，加入Service池
+func (server *Server) Register(rcvr interface{}) error {
+	s := newService(rcvr)
+	//LoadOrStore 返回键的现有值（如果存在）。 否则，它存储并返回给定值。
+	//如果值已加载，则加载结果为 true；如果已存储，则加载结果为 false。
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+// Register publishes the receiver's methods in the DefaultServer.
+func Register(rcvr interface{}) error { return DefaultSever.Register(rcvr) }
+
 /*
-目前还不能判断 body 的类型，
-因此在 readRequest 和 handleRequest 中，
-day1 将 body 作为字符串处理。
-接收到请求，打印 header，
-并回复 geerpc resp ${req.h.Seq}。这一部分后续再实现。
+因为 ServiceMethod 的构成是 “Service.Method”，
+因此先将其分割成 2 部分，
+第一部分是 Service 的名称，第二部分即方法名。
+现在 serviceMap 中找到对应的 service 实例，
+再从 service 实例的 method 中，找到对应的 methodType。
+
 */
+
+// 发现服务：
+// 1、在Server的服务池中查询服务
+// 2、在Service的方法池中查询方法
+func (server *Server) findService(serviceMethod string) (svc *service, mtype *methodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+
+	svc = svci.(*service)
+	mtype = svc.method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
+}
