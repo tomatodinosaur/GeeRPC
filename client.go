@@ -2,12 +2,16 @@ package geerpc
 
 import (
 	"GeeRPC/codec"
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -68,6 +72,8 @@ type Client struct {
 	//有错误关闭
 	shutdown bool //user has told us to stop
 }
+
+var _ io.Closer = (*Client)(nil)
 
 // var _ io.Closer = (*Client)(nil)
 var ErrShutdown = errors.New("connection is shut down")
@@ -144,7 +150,7 @@ func (client *Client) receive() {
 		if err = client.cc.ReadHeader(&h); err != nil {
 			break
 		}
-		call := client.pending[h.Seq]
+		call := client.removeCall(h.Seq)
 		switch {
 		case call == nil:
 			// it usually means that Write partially failed
@@ -162,6 +168,7 @@ func (client *Client) receive() {
 			call.done()
 		}
 	}
+	// error occurs, so terminateCalls pending calls
 	client.terminateCalls(err)
 }
 
@@ -179,7 +186,7 @@ func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 		log.Println("rpc client: codec error:", err)
 		return nil, err
 	}
-	// send options with sever
+	// send options with server
 	if err := json.NewEncoder(conn).Encode(opt); err != nil {
 		log.Println("rpc client: options error: ", err)
 		_ = conn.Close()
@@ -284,10 +291,10 @@ err := client.Call(ctx, "Foo.Sum", &Args{1, 2}, &reply)
 ...
 */
 
-func (client *Client) Call(ctx context.Context, ServiceMethod string, args, reply interface{}) error {
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
 	//创建call,注册call,移除call，等待发送call完成
-	call := client.Go(ServiceMethod, args, reply, make(chan *Call, 1))
 
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
 	select {
 	case <-ctx.Done():
 		client.removeCall(call.Seq)
@@ -334,34 +341,84 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (cli
 	if err != nil {
 		return nil, err
 	}
-
+	// close the connection if client is nil
 	defer func() {
 		if err != nil {
 			_ = conn.Close()
 		}
-
 	}()
-
 	ch := make(chan clientResult)
 	go func() {
 		client, err := f(conn, opt)
-		ch <- clientResult{client, err}
+		ch <- clientResult{client: client, err: err}
 	}()
 	if opt.ConnectTimeout == 0 {
 		result := <-ch
 		return result.client, result.err
 	}
-
 	select {
 	case <-time.After(opt.ConnectTimeout):
 		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
 	case result := <-ch:
 		return result.client, result.err
-
 	}
 }
 
 // Dial connects to an RPC server at the specified network address
 func Dial(network, address string, opts ...*Option) (client *Client, err error) {
 	return dialTimeout(NewClient, network, address, opts...)
+}
+
+/*
+向 TCP 连接写入一个 CONNECT 请求，请求的路径是默认的 RPC 路径，
+也就是 /_geerpc_，这是为了告诉服务器，
+这是一个 RPC 连接，而不是普通的 HTTP 连接。
+
+从 TCP 连接读取一个 HTTP 响应，
+使用 http.ReadResponse 函数，
+它的参数是一个 bufio.Reader 和一个 http.Request，
+分别表示一个缓冲读取器和一个 HTTP 请求对象。
+
+检查 HTTP 响应的状态是否是 connected，
+也就是 200 Connected to Gee RPC，如果是，
+就表示连接成功，然后调用 NewClient 函数，创建一个 RPC 客户端，
+返回给调用者。
+
+如果 HTTP 响应的状态不是 connected，
+就表示连接失败，返回一个错误信息，包含 HTTP 响应的状态。
+*/
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+
+}
+
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// XDial calls different functions to connect to a RPC server
+// according the first parameter rpcAddr.
+// rpcAddr is a general format (protocol@addr) to represent a rpc server
+// eg, http@10.0.0.1:7001, tcp@10.0.0.1:9999, unix@/tmp/geerpc.sock
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp, unix or other transport protocol
+		return Dial(protocol, addr, opts...)
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -28,6 +29,12 @@ var DefaultOption = &Option{
 	CodecType:      codec.GobType,
 	ConnectTimeout: time.Second * 10,
 }
+
+const (
+	connected        = "200 connected to Gee RPC"
+	defaultRPCPath   = "/_geerpc_"
+	defaultDebugPath = "/debug/geerpc"
+)
 
 /*
 GeeRPC 客户端固定采用 JSON 编码 Option，
@@ -96,7 +103,7 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 		log.Println("rpc server:invalid codec type :", opt.CodecType)
 		return
 	}
-	server.severCodec(f(conn))
+	server.severCodec(f(conn), &opt)
 }
 
 // invalidRequest是发生错误时响应argv的占位符
@@ -116,7 +123,7 @@ handleRequest 使用了协程并发执行请求。
 尽力而为，只有在 header 解析失败时，才终止循环。
 */
 
-func (server *Server) severCodec(cc codec.Codec) {
+func (server *Server) severCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
@@ -130,7 +137,7 @@ func (server *Server) severCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg, DefaultOption.HandleTimeout)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	cc.Close()
@@ -271,11 +278,56 @@ func (server *Server) findService(serviceMethod string) (svc *service, mtype *me
 		err = errors.New("rpc server: can't find service " + serviceName)
 		return
 	}
-
 	svc = svci.(*service)
 	mtype = svc.method[methodName]
 	if mtype == nil {
 		err = errors.New("rpc server: can't find method " + methodName)
 	}
 	return
+}
+
+// 支持Http协议
+
+/*
+ServeHTTP 方法首先检查请求的方法是否是 CONNECT，
+如果不是，
+就返回一个 405 的状态码，表示方法不允许，然后结束处理。
+
+如果请求的方法是 CONNECT，
+那么就使用 http.Hijacker 接口，获取底层的 TCP 连接，
+这样就可以直接和客户端进行二进制数据的交换，而不需要 HTTP 协议的封装。
+
+如果获取 TCP 连接成功，
+就向客户端发送一个 HTTP/1.0 200 Connected to Gee RPC 的响应，
+表示连接建立成功，然后调用 server.ServeConn 方法，开始处理 RPC 的消息。
+*/
+// ServeHTTP implements an http.Handler that answers RPC requests.
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	server.ServeConn(conn)
+}
+
+// HandleHTTP registers an HTTP handler for RPC messages on rpcPath,
+// and a debugging handler on debugPath.
+// It is still necessary to invoke http.Serve(), typically in a go statement.
+func (server *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, server)
+	http.Handle(defaultDebugPath, debugHTTP{server})
+	log.Println("rpc server debug path:", defaultDebugPath)
+}
+
+// HandleHTTP is a convenient approach for default server to register HTTP handlers
+func HandleHTTP() {
+	DefaultSever.HandleHTTP()
 }
