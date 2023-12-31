@@ -18,10 +18,10 @@ import (
 const MagicNumber = 0x3bef5c
 
 type Option struct {
-	MagicNumber    int        //MagicNumber marks this's a geerpc request
-	CodecType      codec.Type //client may choose different codec to encode body
-	ConnectTimeout time.Duration
-	HandleTimeout  time.Duration
+	MagicNumber    int           //标记RPC连接
+	CodecType      codec.Type    //编解码种类
+	ConnectTimeout time.Duration //连接超时时间
+	HandleTimeout  time.Duration //处理超时时间
 }
 
 var DefaultOption = &Option{
